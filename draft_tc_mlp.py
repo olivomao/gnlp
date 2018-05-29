@@ -2,6 +2,7 @@
 a draft py to do text classification via MLP
 '''
 
+import io
 import tensorflow as tf
 from tensorflow.python.keras.datasets import imdb
 from tensorflow.python.keras.preprocessing import sequence
@@ -10,6 +11,8 @@ import os,re,pdb,collections
 import tempfile
 import numpy as np
 import pandas as pd
+
+import logging
 
 '''
 code from: https://medium.com/tensorflow/+\
@@ -58,6 +61,7 @@ def preprocess_data_IMDB(data_dir=None):
                             for x in x_train_variable])
     x_len_test = np.array([min(len(x), sentence_size) \
                            for x in x_test_variable])
+    word_index = imdb.get_word_index()
     #pdb.set_trace()  
     return IMDB_PreProcessedData(x_train=x_train,
                                  y_train=y_train,
@@ -65,7 +69,11 @@ def preprocess_data_IMDB(data_dir=None):
                                  x_test=x_test,
                                  y_test=y_test,
                                  x_len_test=x_len_test,
-                                 vocab_size=vocab_size)
+                                 vocab_size=vocab_size,
+                                 embedding_size=embedding_size,
+                                 word_index = word_index
+                                 )
+                                   
 
 '''
 preprocess the raw data files specified to RottenTomatoes
@@ -154,7 +162,9 @@ class IMDB_PreProcessedData(
                                 "x_test",
                                 "y_test",
                                 "x_len_test",
-                                "vocab_size"
+                                "vocab_size",
+                                "embedding_size",
+                                "word_index"
                                ))):
     pass
 
@@ -168,7 +178,7 @@ class Data(object):
     def __init__(self,
                  task,
                  data_dir,
-                 embd_dir=None,
+                 embd_path=None,
                  model_dir=None):
         
         print('Data object created')
@@ -185,12 +195,45 @@ class Data(object):
                                  data_dir)
         print('preprocess_data done')
 
+        self.embedding_matrix = \
+            self.load_embedding(embd_path)
+
         self.classifier = self.get_classifier()
+        check_variables()
 
         pass
 
+    def load_embedding(self, embd_path):
+        vocab_size = self.PreProcessedData.vocab_size
+        embedding_size = self.PreProcessedData.embedding_size
+        if embd_path is None:
+            print('no embd_path')
+            return None
+
+        embeddings = {}
+        with io.open(embd_path, 'r', encoding='utf-8') as f:
+            for line in f:
+	        values = line.strip().split()
+		w = values[0]
+		vectors = np.asarray(values[1:], dtype='float32')
+		embeddings[w] = vectors
+
+	embedding_matrix = np.random.uniform(-1, 1, 
+                size=(self.PreProcessedData.vocab_size,
+                      self.PreProcessedData.embedding_size))
+	num_loaded = 0
+	for w, i in self.PreProcessedData.word_index.items():
+	    v = embeddings.get(w)
+	    if v is not None and i < vocab_size:
+	        embedding_matrix[i] = v
+		num_loaded += 1
+	print('Successfully loaded pretrained embeddings')
+	embedding_matrix = embedding_matrix.astype(np.float32)
+	return embedding_matrix
+
     def run(self):
 
+        logging.getLogger().setLevel(logging.INFO) 
         print(self.classifier.train(input_fn=self.train_input_fn,
                               steps=2500))
         #pdb.set_trace()
@@ -291,6 +334,9 @@ class Data(object):
         column = tf.feature_column.\
                  categorical_column_with_identity(\
                  'x', self.PreProcessedData.vocab_size)
+        column = tf.feature_column.embedding_column(column, 
+                                                    dimension=\
+                                                    self.PreProcessedData.embedding_size)
         return [column]
 
 
@@ -309,23 +355,109 @@ class Data(object):
 
     def get_classifier_IMDB(self):
 
+        #'''
         classifier = tf.estimator.LinearClassifier(\
                      feature_columns=self.get_feature_columns(),
                      model_dir=self.model_dir)
+        #'''
+        '''
+        classifier = tf.estimator.DNNClassifier(
+                        hidden_units=[100],
+                        feature_columns=self.get_feature_columns(), 
+                        model_dir=self.model_dir)
+        '''
+        classifier = self.get_classifier_IMDB_LSTM()
+
 
         return classifier
-       
-        
+
+    def get_classifier_IMDB_LSTM(self):
+
+	'''
+        The head already knows how to compute predictions, loss, 
+        train_op, metrics and export outputs, and can be reused across models. 
+        '''
+        head = tf.contrib.estimator.binary_classification_head()
+        vocab_size = self.PreProcessedData.vocab_size
+        embedding_size = self.PreProcessedData.embedding_size
+
+        def my_initializer(shape=None, dtype=tf.float32, partition_info=None):
+            assert dtype is tf.float32
+            return self.embedding_matrix
+
+        if self.embedding_matrix is None:
+            params = {}
+        else:
+            params = {'embedding_initializer': my_initializer}
+
+	def lstm_model_fn(features, labels, mode, params):    
+	    # [batch_size x sentence_size x embedding_size]
+            #! feature columns are not used here
+            #! we can do embedding mapping here
+            if 'embedding_initializer' in params:
+                embd_initializer = params['embedding_initializer']
+
+            else:
+                embd_initializer = tf.random_uniform_initializer(-1.0, 1.0)
+	    inputs = tf.contrib.layers.embed_sequence(
+		    features['x'], vocab_size, embedding_size,
+		    initializer=embd_initializer)
+
+	    # create an LSTM cell of size 100
+	    lstm_cell = tf.nn.rnn_cell.BasicLSTMCell(100)
+	    
+	    # create the complete LSTM
+	    _, final_states = tf.nn.dynamic_rnn(
+		lstm_cell, inputs, sequence_length=features['len'], dtype=tf.float32)
+
+	    # get the final hidden states of dimensionality [batch_size x sentence_size]
+	    outputs = final_states.h
+
+	    logits = tf.layers.dense(inputs=outputs, units=1)
+
+	    # This will be None when predicting
+	    if labels is not None:
+		labels = tf.reshape(labels, [-1, 1])
+
+	    optimizer = tf.train.AdamOptimizer()
+
+	    def _train_op_fn(loss):
+		return optimizer.minimize(
+		    loss=loss,
+		    global_step=tf.train.get_global_step())
+
+            #! need to understand more about head
+            #  estimator_spec, and progress print 
+	    return head.create_estimator_spec(
+		     features=features,
+		     labels=labels,
+		     mode=mode,
+		     logits=logits,
+		     train_op_fn=_train_op_fn)
+
+
+	lstm_classifier = tf.estimator.Estimator(model_fn=lstm_model_fn,
+						 model_dir=self.model_dir)
+        return lstm_classifier
+	       
+def check_variables():
+    vs = tf.trainable_variables()
+    print("There are %d trainable variables"%len(vs))
+    for v in vs:
+        print v
 
 def main(argv=None):
     task='IMDB' #'MovieReview_RottenTomatoes'
     data_dir=None #'/home/shunfu/gnlp/data/'+'MovieReview_RottenTomatoes/'
-    embd_dir=None
+    embd_path="/home/shunfu/gnlp/embedding/glove/glove.6B.50d.txt"
 
     data = \
     Data(task,
          data_dir,
-         embd_dir)
+         embd_path)
+
+    pdb.set_trace()
+    check_variables()
 
     data.run()
 
