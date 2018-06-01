@@ -4,14 +4,20 @@ import collections
 import io
 import os
 import pdb
+import time
+import subprocess
 
 import tensorflow as tf
 import numpy as np
-import pandas as pd
+try:
+    import pandas as pd
+except:
+    run_cmd('pip install pandas')
 
 #for imdb
 from tensorflow.python.keras.datasets import imdb
 from tensorflow.python.keras.preprocessing import sequence
+from tensorflow.python.ops import init_ops
 
 #for rt
 import re
@@ -43,6 +49,7 @@ class BaseTask(object):
 
         self.embedding_matrix =\
             self.load_embedding(embd_path)
+	#pdb.set_trace()
 
         pass
 
@@ -50,6 +57,19 @@ class BaseTask(object):
     def preprocess_data(self, data_dir):
         pass
 
+    '''
+    load embeddings (|DicSize|, embedding_size=M)
+    from embd_path (w v0 ... v_M-1)
+
+    build embedding_matrix (vocab_size, embedding_size=M)
+    for the task
+
+    if embeddings is None, embedding_matrix is rand
+    otherwise,
+    -	if the word from task is not in Dic, it's represented
+	by a rand vector
+    -   if the word from task is in Dic, use Dic's representation
+    '''
     def load_embedding(self, embd_path=None):
         print('load_embedding')
 
@@ -57,9 +77,12 @@ class BaseTask(object):
         embedding_size = self.configs['embedding_size']
 
         if embd_path is None:
-            print('no embd_path')
-            return None
+            print('no embd_path; embedding_matrix rand init')
+            embedding_matrix = np.random.uniform(-1, 1, 
+                size=(vocab_size, embedding_size))
+	    return embedding_matrix.astype(np.float32)
 
+        #embd_path not None
         embeddings = {}
         with io.open(embd_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -76,7 +99,9 @@ class BaseTask(object):
 	    if v is not None and i < vocab_size:
 	        embedding_matrix[i] = v
 		num_loaded += 1
-	print('Successfully loaded pretrained embeddings')
+	print('Successfully loaded pretrained embeddings'+\
+	      'num_loaded=%d and vocab_size=%d'\
+	      %(num_loaded, vocab_size))
 	embedding_matrix = embedding_matrix.astype(np.float32)
 	return embedding_matrix
 
@@ -96,6 +121,10 @@ class BaseTask(object):
     def test_input_fn(self):
         pass
 
+    '''
+    get a model and model_dir(store ckpt etc)
+    for task
+    '''
     def get_model(self, model_name,
                      model_dir=None):
         if model_dir is None:
@@ -110,16 +139,28 @@ class BaseTask(object):
 
     def train(self):
         print('train')
-        self.model.estimator.\
-                   train(input_fn=self.train_input_fn,
+
+        if self.configs['debug_tpu']==False: #self.configs['use_tpu']==False:
+	    params = {'batch_size':self.configs['batch_size']}
+            self.model.estimator.\
+                   train(input_fn=lambda: self.train_input_fn(params),
                          steps=self.configs['steps'])
-        pass
+        else:
+	    self.model.estimator.\
+	           train(input_fn=self.train_input_fn,
+		         max_steps=self.configs['train_max_steps'])
 
     def eval(self):
         print('eval')
-        self.model.estimator.\
-                   evaluate(input_fn=self.test_input_fn)
-        pass
+
+        if self.configs['debug_tpu']==False: #self.configs['use_tpu']==False:
+	    params = {'batch_size':self.configs['batch_size']}
+            self.model.estimator.\
+                   evaluate(input_fn=lambda: self.test_input_fn(params))
+        else:
+	    self.model.estimator.\
+	           evaluate(input_fn=self.test_input_fn,
+		            steps=self.configs['eval_steps'])
 
 class IMDB_Task(BaseTask):
 
@@ -138,6 +179,12 @@ class IMDB_Task(BaseTask):
 
 	print('IMDB_Task init')
 
+    '''
+    input: data_dir, stores task-specific data
+    output: PreProcessedData necessary for tf.dataset
+
+    for IMDB Task, we can pre-load existing data
+    '''
     def preprocess_data(self, data_dir):
         print('IMDB_Task preprocess_data')
         
@@ -190,7 +237,10 @@ class IMDB_Task(BaseTask):
 				x_len_test=x_len_test,
 				vocab_size=vocab_size,
 				word_index = word_index)
-
+    '''
+    provide task-specific feature columns,
+    mainly used for DNN/CustomDNN model
+    '''
     def get_feature_columns(self):
 
         column = tf.feature_column.\
@@ -209,22 +259,49 @@ class IMDB_Task(BaseTask):
         features = {"x":x, "len":length}
         return features, y
 
-    def train_input_fn(self):
+    '''
+    src data (Nsamples, max_time) into iterator (bs, max_time)
+
+    params['batch_size'] is used in support of TPU
+    '''
+    #'''
+    def train_input_fn(self, params):
 
        x_train = self.PreProcessedData.x_train
        y_train = self.PreProcessedData.y_train
        x_len_train = self.PreProcessedData.x_len_train
        dataset = tf.data.Dataset.from_tensor_slices(\
                  (x_train, x_len_train, y_train))
-
-       dataset = dataset.shuffle(buffer_size=len(x_train))
-       dataset = dataset.batch(self.configs['batch_size'])
-       dataset = dataset.map(self.parser)
+       dataset = dataset.map(self.parser,
+                             num_parallel_calls=self.configs['n_cpu'])
+       dataset = dataset.shuffle(buffer_size=len(x_train),
+                                 seed=self.configs['rand_seed'])
        dataset = dataset.repeat()
+
+       dataset = dataset.apply(\
+            tf.contrib.data.batch_and_drop_remainder(params['batch_size']))
+
+       #dataset = dataset.batch(params['batch_size'])
+       dataset = dataset.prefetch(buffer_size=2)#prefetch 2 batches
        iterator = dataset.make_one_shot_iterator()
        return iterator.get_next()
+    #'''
+    '''#dummy for debug
+    def train_input_fn(self, params):
+        # Generate a random dataset of the correct shape
+        data = np.random.rand(1024, 50).astype(np.float32)
+        label = np.random.randint(2, size=(1024))#.astype(np.float32)
 
-    def test_input_fn(self):
+        # Repeat and batch
+        rand_dataset = tf.data.Dataset.from_tensor_slices((data, label)).repeat()
+        rand_dataset = rand_dataset.apply(tf.contrib.data.batch_and_drop_remainder(params['batch_size']))
+
+        # Make input_fn for the TPUEstimator train step
+        rand_dataset_fn = rand_dataset.make_one_shot_iterator().get_next()
+        return rand_dataset_fn
+    '''
+
+    def test_input_fn(self, params):
 
        x_test = self.PreProcessedData.x_test
        y_test = self.PreProcessedData.y_test
@@ -232,8 +309,16 @@ class IMDB_Task(BaseTask):
 
        dataset = tf.data.Dataset.from_tensor_slices(\
                  (x_test, x_len_test, y_test))
-       dataset = dataset.batch(self.configs['batch_size'])
-       dataset = dataset.map(self.parser)
+       dataset = dataset.map(self.parser,
+                             num_parallel_calls=self.configs['n_cpu'])
+       
+       #batch_size = len(x_test)
+       #batch_size = batch_size - batch_size % 128
+       batch_size = params["batch_size"]
+       dataset = dataset.apply(\
+            tf.contrib.data.batch_and_drop_remainder(batch_size))#for TPU purpose
+
+       #dataset = dataset.batch(len(x_test))#whole test set
        iterator = dataset.make_one_shot_iterator()
        return iterator.get_next()
 
@@ -257,7 +342,7 @@ class DNN_Model(BaseModel):
 
         self.estimator = \
             tf.estimator.DNNClassifier(
-               hidden_units=[100],
+               hidden_units=task.configs['hidden_units'],
                feature_columns=task.get_feature_columns(),
                model_dir=model_dir)
 
@@ -267,6 +352,7 @@ class CustomDNN_Model(BaseModel):
         super(CustomDNN_Model, self).__init__()
         print('CustomDNN_Model init')
 
+        self.task = task
         self.estimator = tf.estimator.Estimator(
 	    model_fn=self.model_fn,
 	    params={'feature_columns': task.get_feature_columns(),
@@ -279,11 +365,15 @@ class CustomDNN_Model(BaseModel):
 	# probability of 0.1.
 	net = tf.feature_column.input_layer(features, params['feature_columns'])
 	for units in params['hidden_units']:
-	    net = tf.layers.dense(net, units=units, activation=tf.nn.relu)
+	    net = tf.layers.dense(net, 
+	                          units=units, 
+				  activation=tf.nn.relu)
 
 	# Compute logits (1 per class).
         #! should be (bs, n_classes)
-	logits = tf.layers.dense(net, params['n_classes'], activation=None)
+	logits = tf.layers.dense(net, 
+	                         params['n_classes'],
+				 activation=None)
 
 	# Compute predictions.
 	predicted_classes = tf.argmax(logits, 1)
@@ -303,7 +393,7 @@ class CustomDNN_Model(BaseModel):
 				       predictions=predicted_classes,
 				       name='acc_op')
 	check_variables()
-	pdb.set_trace()
+	#pdb.set_trace()
 	'''
 	accuracy = tf.Print(accuracy, 
 	              [tf.shape(logits), 
@@ -324,9 +414,132 @@ class CustomDNN_Model(BaseModel):
 	# Create training op.
 	assert mode == tf.estimator.ModeKeys.TRAIN
 
-	optimizer = tf.train.AdagradOptimizer(learning_rate=0.1)
+	optimizer = tf.train.AdagradOptimizer(learning_rate=0.05)
 	train_op = optimizer.minimize(loss, global_step=tf.train.get_global_step())
 	return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
+
+class CustomDNN_TPU_Model(BaseModel):
+
+    def __init__(self, model_dir, task):
+        super(CustomDNN_TPU_Model, self).__init__()
+        print('CustomDNN_TPU_Model init')
+
+        self.task = task
+
+	#pdb.set_trace()
+
+	tpu_cluster_resolver = \
+          tf.contrib.cluster_resolver.TPUClusterResolver(
+	      task.configs['tpu'],
+	      zone=task.configs['tpu_zone'],
+	      project=task.configs['gcp_project'])
+	
+        run_config = \
+          tf.contrib.tpu.RunConfig(
+	      cluster=tpu_cluster_resolver,
+	      model_dir=model_dir,
+	      session_config=tf.ConfigProto(
+		  allow_soft_placement=True, 
+                  log_device_placement=True),
+	      tpu_config=\
+              tf.contrib.tpu.TPUConfig(task.configs['TPUConfig_iterations'], 
+                                       task.configs['TPUConfig_num_shards']))
+
+
+        self.estimator = tf.contrib.tpu.TPUEstimator(
+	    model_fn=self.model_fn,
+	    model_dir=model_dir,
+	    config=run_config,
+	    params={'feature_columns': task.get_feature_columns(),
+		    'hidden_units': task.configs['hidden_units'],
+		    'n_classes': task.configs['n_classes']},
+            use_tpu=task.configs['use_tpu'],
+	    train_batch_size=task.configs['train_batch_size'],
+	    eval_batch_size=task.configs['eval_batch_size'],
+	    predict_batch_size=task.configs['predict_batch_size']
+	    )
+	#params: passed to model_fn/input_fn;'batch_size' reserved
+	#pdb.set_trace()
+
+    def model_fn(self, features, labels, 
+                       mode, params):
+        
+	print("mode PREDICT not uspported yet")
+	if mode == tf.estimator.ModeKeys.PREDICT:
+	    raise RuntimeError("mode {} is not supported yet".format(mode))
+	# Create three fully connected layers each layer having a dropout
+	# probability of 0.1.
+	#net = tf.feature_column.input_layer(features, params['feature_columns'])
+        #dummy debug
+
+        with tf.name_scope('input_batch'):
+            net = tf.nn.embedding_lookup(\
+                  self.task.embedding_matrix,
+                  features['x'],
+                  name="net_embd") #[batch_size, max_time, num_units]
+            net = tf.reduce_sum(net, 1, name="net_combine") #[batch_size, num_units]
+
+        with tf.name_scope('hidden_layers'):
+            lidx = 0
+
+	    for units in params['hidden_units']:
+                lidx +=1
+	        net = tf.layers.dense(net, 
+	                          units=units, 
+				  activation=tf.nn.relu,
+                                  name="layer_%d"%lidx)
+
+	# Compute logits (1 per class).
+        #! should be (bs, n_classes)
+	logits = tf.layers.dense(net, 
+	                         params['n_classes'],
+				 activation=None,
+                                 name="logits")
+
+	# Compute predictions.
+	predicted_classes = tf.argmax(logits, 1, name="predicted_classes")
+	'''
+	if mode == tf.estimator.ModeKeys.PREDICT:
+	    predictions = {
+		'class_ids': predicted_classes[:, tf.newaxis],
+		'probabilities': tf.nn.softmax(logits),
+		'logits': logits,
+	    }
+	    return tf.estimator.EstimatorSpec(mode, predictions=predictions)
+	'''
+
+	# Compute loss.
+	loss = tf.losses.sparse_softmax_cross_entropy(labels=labels,
+                                                      logits=logits,
+                                                      )
+        loss = tf.identity(loss,name="loss")
+
+	# Compute evaluation metrics.
+        def metric_fn(labels, logits):
+	    accuracy = tf.metrics.accuracy(labels=labels,
+		predictions=tf.argmax(logits, axis=1),
+                name="accuracy")
+            return {"accuracy": accuracy}
+
+	check_variables()
+
+	if mode == tf.estimator.ModeKeys.EVAL:
+	    return tf.contrib.tpu.TPUEstimatorSpec(
+		mode=mode, loss=loss, eval_metrics=(metric_fn, [labels, logits]))
+
+	# Create training op.
+	assert mode == tf.estimator.ModeKeys.TRAIN
+
+        with tf.name_scope("train"):
+	    optimizer = tf.train.AdagradOptimizer(learning_rate=0.05,
+                                                  name="AdagradOptimizer")
+	    optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer,
+                                                  name="CrossShardOptimizer")
+	    train_op = optimizer.minimize(loss, 
+	                              global_step=tf.train.get_global_step(),
+                                      name="train_op")
+	return tf.contrib.tpu.TPUEstimatorSpec(
+	         mode=mode, loss=loss, train_op=train_op)
 
 class CustomLSTM_Model(BaseModel):
 
@@ -359,7 +572,8 @@ class CustomLSTM_Model(BaseModel):
 	if self.task.embedding_matrix is not None:
 	    embd_initializer = my_initializer
 	else:
-	    embd_initializer = tf.random_uniform_initializer(-1.0, 1.0)
+	    embd_initializer = tf.random_uniform_initializer(\
+	            -1.0, 1.0, seed=self.task.configs['rand_seed'])
 
         vocab_size = self.task.PreProcessedData.vocab_size
 	embedding_size = self.task.configs['embedding_size']
@@ -395,7 +609,7 @@ class CustomLSTM_Model(BaseModel):
 		global_step=tf.train.get_global_step())
 
         check_variables()
-	pdb.set_trace()
+	#pdb.set_trace()
 
 	#! need to understand more about head
 	#  estimator_spec, and progress print 
@@ -407,6 +621,29 @@ class CustomLSTM_Model(BaseModel):
 		 train_op_fn=_train_op_fn)
 
 #################### EXTERNAL HELPER FUNCTIONS
+
+def run_cmd(cmd, shell=True):
+    subprocess.call(cmd, shell=shell)
+
+class Clock:
+    def __init__(self):
+	self.last = time.time()
+
+    def time(self):
+	cur = time.time()
+	elapsed = cur - self.last
+	self.last = cur
+	return elapsed
+
+    def asctime(self):
+	return str(time.asctime())
+
+'''
+time_stats: {description: used_time}
+'''
+def show_time_stats(time_stats):
+    for d, t in time_stats.items():
+	print('%s uses %d sec'%(d, t))
 
 class PreProcessedData(
     collections.namedtuple("PreProcessedData",
@@ -445,6 +682,8 @@ def create_model(model_name, model_dir, task):
         return DNN_Model(model_dir,task)
     elif model_name == 'CustomDNN':
         return CustomDNN_Model(model_dir, task)
+    elif model_name == 'CustomDNN_TPU':
+        return CustomDNN_TPU_Model(model_dir, task)
     elif model_name == 'CustomLSTM':
         return CustomLSTM_Model(model_dir, task)
     else:
@@ -461,25 +700,63 @@ def check_variables():
 #################### MAIN FUNCTION
 
 def main(argv=None):
+    
     task_name = 'IMDB'
     task_data_dir = None 
-    embedding_path = '/home/shunfu/gnlp/'+\
-                     'embedding/glove/glove.6B.50d.txt'
+    #embedding_path = '/home/shunfu/gnlp/'+\
+    #                 'embedding/glove/glove.6B.50d.txt'
+    embedding_path = None
+    
     #model_name = 'DNN'
     #model_name = 'CustomDNN'
-    model_name = 'CustomLSTM'
-    model_dir = None
-
+    model_name = 'CustomDNN_TPU'
+    #model_name = 'CustomLSTM'
+    
     configs = {}
+    configs['rand_seed']=0 #for reproducibility
+    np.random.seed(configs['rand_seed'])
+
+    configs['n_cpu']=10
+
+    configs['using_gcp']=True
+    configs['debug_tpu']=True #to enable different input_fn branches
+    configs['use_tpu']=True
+
+    if configs['using_gcp']==True:
+        model_dir = 'gs://tpu-test-20180530/log/20180531_1/'
+    else:
+        model_dir = 'tmp'
+        if os.path.exists(model_dir)==False:
+            os.mkdir(model_dir)
+
+    configs['tpu']='shunfu'
+    configs['tpu_zone']='us-central1-b'
+    configs['gcp_project']='tpu-test-204616'
+    configs['TPUConfig_iterations']=50
+    configs['TPUConfig_num_shards']=8
+    #  TPUEstimator transforms this global batch size to a per-shard batch size, as params['batch_size'], when calling input_fn and model_fn. Cannot be None if use_tpu is True. Must be divisible by total number of replicas.
+    configs['train_batch_size']=1024
+    #  eval_batch_size: An int representing evaluation batch size. Must be divisible by total number of replicas.
+    configs['eval_batch_size']=1024
+    configs['predict_batch_size']=None
+
+    configs['train_max_steps']=3000
+    configs['eval_steps']=1 #num eval = eval_steps * batch_size
+
     configs['vocab_size']=5000
     configs['max_time']=200
     configs['embedding_size']=50
     configs['steps']=500
-    configs['batch_size']=100
+    configs['batch_size']=128
 
     configs['hidden_units']=[100]
     configs['LSTM_hidden_units']=[100]
     configs['n_classes']=2
+
+    #create task and model which
+    #will be applied onto the task
+    clock = Clock()
+    time_stats = {}
 
     task = create_task(task_name,
                        task_data_dir,
@@ -488,9 +765,17 @@ def main(argv=None):
                        model_dir,
                        configs)
 
+    time_stats['create_task']=clock.time()
+
+    
+    pdb.set_trace()
     task.train()
+    time_stats['task.train']=clock.time()
 
     task.eval()
+    time_stats['task.eval']=clock.time()
+
+    show_time_stats(time_stats)
 
     return
 
