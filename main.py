@@ -140,7 +140,7 @@ class BaseTask(object):
     def train(self):
         print('train')
 
-        if self.configs['debug_tpu']==False: #self.configs['use_tpu']==False:
+        if self.configs['apply_TPUEstimator']==False: #self.configs['use_tpu']==False:
 	    params = {'batch_size':self.configs['batch_size']}
             self.model.estimator.\
                    train(input_fn=lambda: self.train_input_fn(params),
@@ -153,7 +153,7 @@ class BaseTask(object):
     def eval(self):
         print('eval')
 
-        if self.configs['debug_tpu']==False: #self.configs['use_tpu']==False:
+        if self.configs['apply_TPUEstimator']==False: #self.configs['use_tpu']==False:
 	    params = {'batch_size':self.configs['batch_size']}
             self.model.estimator.\
                    evaluate(input_fn=lambda: self.test_input_fn(params))
@@ -548,77 +548,145 @@ class CustomLSTM_Model(BaseModel):
         print('CustomLSTM_Model init')
 
         self.task = task
-        self.estimator = tf.estimator.Estimator(
-	                   model_fn=self.model_fn,
-			   model_dir=model_dir) 
+        self.apply_TPUEstimator = task.configs['apply_TPUEstimator']
+        self.use_tpu = task.configs['use_tpu']
+
+        if self.apply_TPUEstimator == True:
+
+	    tpu_cluster_resolver = \
+              tf.contrib.cluster_resolver.TPUClusterResolver(
+	        task.configs['tpu'],
+	        zone=task.configs['tpu_zone'],
+	        project=task.configs['gcp_project'])
+	
+            run_config = \
+              tf.contrib.tpu.RunConfig(
+	        cluster=tpu_cluster_resolver,
+	        model_dir=model_dir,
+	        session_config=tf.ConfigProto(
+		  allow_soft_placement=True, 
+                  log_device_placement=True),
+	        tpu_config=\
+                tf.contrib.tpu.TPUConfig(task.configs['TPUConfig_iterations'], 
+                                         task.configs['TPUConfig_num_shards']))
+
+
+            self.estimator = tf.contrib.tpu.TPUEstimator(
+	        model_fn=self.model_fn,
+	        model_dir=model_dir,
+	        config=run_config,
+	        params={},
+                use_tpu=task.configs['use_tpu'],
+	        train_batch_size=task.configs['train_batch_size'],
+	        eval_batch_size=task.configs['eval_batch_size'],
+	        predict_batch_size=task.configs['predict_batch_size']
+	        )
+	#
+        else:
+            self.estimator = tf.estimator.Estimator(
+	                       model_fn=self.model_fn,
+			       model_dir=model_dir) 
 
     def model_fn(self, features, labels, mode):    
-    
-        def my_initializer(shape=None, 
-	                   dtype=tf.float32, 
-			   partition_info=None):
-            assert dtype is tf.float32
-            return self.task.embedding_matrix
+   
+        with tf.name_scope('input_batch'):
+            inputs = tf.nn.embedding_lookup(\
+                       self.task.embedding_matrix,
+                       features['x'],
+                       name="inputs_embd") #[bs, max_time, embd_size]
 
-        if self.task.configs['n_classes']==2:
-	    head = tf.contrib.estimator.binary_classification_head()
-	else:
-	    print('header is None')
-	    head = None 
+        with tf.name_scope('LSTM'):
+	    # create an LSTM cell of size 100
+	    lstm_cell = tf.nn.rnn_cell.BasicLSTMCell(\
+	                  self.task.configs['LSTM_hidden_units'][0],
+                          name="lstm_cell")
 	
-	# [batch_size x sentence_size x embedding_size]
-	#! feature columns are not used here
-	#! we can do embedding mapping here
-	if self.task.embedding_matrix is not None:
-	    embd_initializer = my_initializer
-	else:
-	    embd_initializer = tf.random_uniform_initializer(\
-	            -1.0, 1.0, seed=self.task.configs['rand_seed'])
+	    # create the complete LSTM
+	    _, final_states = tf.nn.dynamic_rnn(
+	                        lstm_cell, inputs, 
+	                        sequence_length=features['len'], 
+	                        dtype=tf.float32)
 
-        vocab_size = self.task.PreProcessedData.vocab_size
-	embedding_size = self.task.configs['embedding_size']
-	inputs = tf.contrib.layers.embed_sequence(
-		features['x'], vocab_size, embedding_size,
-		initializer=embd_initializer)
+        with tf.name_scope('output_batch'):
 
-	# create an LSTM cell of size 100
-	lstm_cell = tf.nn.rnn_cell.BasicLSTMCell(\
-	    self.task.configs['LSTM_hidden_units'][0])
-	
-	# create the complete LSTM
-	_, final_states = tf.nn.dynamic_rnn(
-	    lstm_cell, inputs, 
-	    sequence_length=features['len'], 
-	    dtype=tf.float32)
+	    # get the final hidden states of dimensionality
+            # [batch_size x sentence_size]
+	    outputs = tf.identity(final_states.h,
+                                  name="outputs")
 
-	# get the final hidden states of dimensionality
-        # [batch_size x sentence_size]
-	outputs = final_states.h
+	    logits = tf.layers.dense(inputs=outputs,
+                                     units=self.task.configs['n_classes'],
+                                     name="logits")
 
-	logits = tf.layers.dense(inputs=outputs, units=1)
+	    # This will be None when predicting
+	    if labels is not None:
+	        labels = tf.reshape(labels, [-1, 1],
+                                    name="labels")
 
-	# This will be None when predicting
-	if labels is not None:
-	    labels = tf.reshape(labels, [-1, 1])
+        #logits = tf.Print(logits, [tf.shape(logits), logits], 'logits')
+        #labels = tf.Print(labels, [tf.shape(labels), labels], 'labels')
 
-	optimizer = tf.train.AdamOptimizer()
+        with tf.name_scope('metrics'):
 
-	def _train_op_fn(loss):
-	    return optimizer.minimize(
-		loss=loss,
-		global_step=tf.train.get_global_step())
+            loss = tf.losses.sparse_softmax_cross_entropy(
+                     labels=labels,
+                     logits=logits)
+            loss = tf.identity(loss, name="loss")
+
+        # return EstimatorSpec or TPUEstimatorSpec
+
+        if mode == tf.estimator.ModeKeys.EVAL:
+
+            def metric_fn(labels, logits):
+                accuracy = tf.metrics.accuracy(labels=labels,
+                             predictions=tf.argmax(logits, axis=1),
+                             name="accuracy")
+                return {"accuracy": accuracy} 
+      
+            metrics = metric_fn(labels, logits)
+            
+            if self.apply_TPUEstimator == False:
+                return tf.estimator.EstimatorSpec(
+                         mode=mode,
+                         loss=loss,
+                         eval_metric_ops=metrics)
+            else:
+                return tf.contrib.tpu.TPUEstimatorSpec(
+                         mode=mode,
+                         loss=loss,
+                         eval_metrics=(metric_fn,
+                                       [labels, logits]))
+
+        assert mode == tf.estimator.ModeKeys.TRAIN
+
+        with tf.name_scope('train'):
+	    
+            optimizer = tf.train.AdamOptimizer(learning_rate=0.05,
+                                               name="AdamOptimizer")
+
+	    def _train_op_fn(loss):
+	        return optimizer.minimize(
+		    loss=loss,
+		    global_step=tf.train.get_global_step(),
+                    name="train_op")
+
+            train_op = _train_op_fn(loss)
 
         check_variables()
-	#pdb.set_trace()
 
-	#! need to understand more about head
-	#  estimator_spec, and progress print 
-	return head.create_estimator_spec(
-		 features=features,
-		 labels=labels,
-		 mode=mode,
-		 logits=logits,
-		 train_op_fn=_train_op_fn)
+        if self.apply_TPUEstimator == False:
+
+            return tf.estimator.EstimatorSpec(
+                     mode=mode,
+                     loss=loss,
+                     train_op=train_op)
+
+        else:
+
+            return tf.contrib.tpu.TPUEstimatorSpec(
+                     mode=mode,
+                     loss=loss,
+                     train_op=train_op)
 
 #################### EXTERNAL HELPER FUNCTIONS
 
@@ -709,8 +777,8 @@ def main(argv=None):
     
     #model_name = 'DNN'
     #model_name = 'CustomDNN'
-    model_name = 'CustomDNN_TPU'
-    #model_name = 'CustomLSTM'
+    #model_name = 'CustomDNN_TPU'
+    model_name = 'CustomLSTM'
     
     configs = {}
     configs['rand_seed']=0 #for reproducibility
@@ -718,12 +786,12 @@ def main(argv=None):
 
     configs['n_cpu']=10
 
-    configs['using_gcp']=True
-    configs['debug_tpu']=True #to enable different input_fn branches
-    configs['use_tpu']=True
+    configs['using_gcp']=True #affects model dir
+    configs['apply_TPUEstimator']=True #to enable codes compatible with TPUEstimator
+    configs['use_tpu']=True #actually use tpu at TPUEstimator
 
     if configs['using_gcp']==True:
-        model_dir = 'gs://tpu-test-20180530/log/20180531_1/'
+        model_dir = 'gs://tpu-test-20180601/log/1/'
     else:
         model_dir = 'tmp'
         if os.path.exists(model_dir)==False:
@@ -743,14 +811,14 @@ def main(argv=None):
     configs['train_max_steps']=3000
     configs['eval_steps']=1 #num eval = eval_steps * batch_size
 
-    configs['vocab_size']=5000
-    configs['max_time']=200
-    configs['embedding_size']=50
-    configs['steps']=500
+    configs['vocab_size']=4096
+    configs['max_time']=256
+    configs['embedding_size']=64
+    configs['steps']=100
     configs['batch_size']=128
 
     configs['hidden_units']=[100]
-    configs['LSTM_hidden_units']=[100]
+    configs['LSTM_hidden_units']=[128]
     configs['n_classes']=2
 
     #create task and model which
@@ -768,7 +836,7 @@ def main(argv=None):
     time_stats['create_task']=clock.time()
 
     
-    pdb.set_trace()
+    #pdb.set_trace()
     task.train()
     time_stats['task.train']=clock.time()
 
