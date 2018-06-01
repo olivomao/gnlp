@@ -591,7 +591,7 @@ class CustomLSTM_Model(BaseModel):
 	                       model_fn=self.model_fn,
 			       model_dir=model_dir) 
 
-    def model_fn(self, features, labels, mode):    
+    def model_fn(self, features, labels, mode, params):    
    
         with tf.name_scope('input_batch'):
             inputs = tf.nn.embedding_lookup(\
@@ -667,6 +667,9 @@ class CustomLSTM_Model(BaseModel):
 	    
             optimizer = tf.train.AdamOptimizer(learning_rate=0.05,
                                                name="AdamOptimizer")
+            if self.use_tpu==True:
+                optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer,
+                                               name="CrossShardOptimizer")
 
 	    def _train_op_fn(loss):
 	        return optimizer.minimize(
