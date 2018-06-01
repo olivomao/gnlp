@@ -9,6 +9,10 @@ import subprocess
 
 import tensorflow as tf
 import numpy as np
+
+def run_cmd(cmd, shell=True):
+    subprocess.call(cmd, shell=shell)
+
 try:
     import pandas as pd
 except:
@@ -689,9 +693,6 @@ class CustomLSTM_Model(BaseModel):
                      train_op=train_op)
 
 #################### EXTERNAL HELPER FUNCTIONS
-
-def run_cmd(cmd, shell=True):
-    subprocess.call(cmd, shell=shell)
 
 class Clock:
     def __init__(self):
